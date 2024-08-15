@@ -2,75 +2,88 @@
 
 namespace DevTest;
 
-use Exception;
-use mysqli;
-
-class Database extends AbstractDatabase implements DatabaseInterface
+class Database implements DatabaseInterface
 {
     public function buildQuery(string $query, array $args = []): string
     {
-        $this->validateTemplate($query);
+        $index = 0;
+        $skipValue = $this->skip();
 
-        $argsCopy = $args;
-        $query = $this->processConditionalBlocks($query, $argsCopy);
-
-        $query = str_replace('SKIP', '', $query);
-
-        $placeholders = [
-            '?d' => fn($value) => $value === null ? 'NULL' : (int)$value,
-            '?f' => fn($value) => $value === null ? 'NULL' : (float)$value,
-            '?a' => fn($value) => $this->processArray($value),
-            '?#' => function ($value) {
-                if (!is_array($value)) {
-                    throw new Exception('Expected array for ?# placeholder.');
+        $query = preg_replace_callback('/\{(.*?)\}/s', function ($matches) use (&$args, $skipValue) {
+            $innerQuery = $matches[1];
+            foreach ($args as $arg) {
+                if ($arg === $skipValue) {
+                    return '';
                 }
-                return $this->processIdentifiers($value);
-            },
-            '?' => fn($value) => $this->processDefault($value)
-        ];
+            }
+            return $innerQuery;
+        }, $query);
 
-        $i = 0;
-        echo "Query before replacement: $query\n";
-        echo "Arguments: " . print_r($args, true) . "\n";
+        $query = preg_replace_callback('/\?([dfa#])?/', function ($matches) use (&$args, &$index) {
+            $type = $matches[1] ?? '';
+            $value = $args[$index++] ?? null;
 
-        $result = preg_replace_callback(
-            '/\?(d|f|a|#)?/',
-            function ($matches) use (&$args, &$i, $placeholders) {
-                $type = $matches[1] ?? '';
-                $placeholder = $matches[0];
-                if (!isset($args[$i])) {
-                    return '?';
-                }
-
-                $value = $args[$i] ?? null;
-                if (isset($placeholders[$placeholder])) {
-                    try {
-                        $result = $placeholders[$placeholder]($value);
-                    } catch (Exception $e) {
-                        throw $e;
+            switch ($type) {
+                case 'd':
+                    return $value === null ? 'NULL' : (int)$value;
+                case 'f':
+                    return $value === null ? 'NULL' : (float)$value;
+                case 'a':
+                    if (!is_array($value)) {
+                        throw new \Exception('Invalid array value.');
                     }
-                } else {
-                    $result = $placeholders['?']($value);
-                }
+                    return $this->formatArray($value);
+                case '#':
+                    return $this->formatIdentifier($value);
+                default:
+                    return $this->formatValue($value);
+            }
+        }, $query);
 
-                $i++;
-                return $result;
-            },
-            $query
-        );
-        echo "Query after replacement: $result\n";
-
-        if ($i > count($args)) {
-            throw new Exception('Too many arguments provided. Expected: ' . count($args) . ', Used: ' . $i);
-        } elseif ($i < count($args)) {
-            throw new Exception('Not enough arguments provided. Expected: ' . count($args) . ', Used: ' . $i);
+        if (preg_match('/\?([dfa#])/', $query)) {
+            throw new \Exception('Not all placeholders were replaced.');
         }
 
-        return $result;
+        return $query;
     }
 
     public function skip()
     {
-        return 'SKIP';
+        return null;
+    }
+
+    private function formatValue($value)
+    {
+        if ($value === null) {
+            return 'NULL';
+        }
+        if (is_bool($value)) {
+            return $value ? '1' : '0';
+        }
+        if (is_string($value)) {
+            return sprintf("'%s'", addslashes($value));
+        }
+        return $value;
+    }
+
+    private function formatIdentifier($value)
+    {
+        if (is_array($value)) {
+            return implode(', ', array_map([$this, 'formatIdentifier'], $value));
+        }
+        return sprintf('`%s`', addslashes($value));
+    }
+
+    private function formatArray(array $array): string
+    {
+        $formatted = [];
+        foreach ($array as $key => $value) {
+            if (is_int($key)) {
+                $formatted[] = $this->formatValue($value);
+            } else {
+                $formatted[] = sprintf('%s = %s', $this->formatIdentifier($key), $this->formatValue($value));
+            }
+        }
+        return implode(', ', $formatted);
     }
 }
